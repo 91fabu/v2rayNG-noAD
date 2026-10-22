@@ -1,3 +1,12 @@
+<div align="center">
+  <h2 style="color: #d73a49; font-weight: bold;">
+    ⚠️ 本项目为 v2rayNG 去广告、去推广修改版 (Mod)
+  </h2>
+  <p><strong>已移除所有商业推广入口及外部推广引流链接，保持与上游代码自动同步构建。</strong></p>
+</div>
+
+---
+
 # v2rayNG
 
 A V2Ray client for Android, support [Xray core](https://github.com/XTLS/Xray-core) and [v2fly core](https://github.com/v2fly/v2ray-core)
