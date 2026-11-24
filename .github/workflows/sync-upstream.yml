@@ -1,0 +1,268 @@
+name: Sync upstream and release
+
+on:
+  schedule:
+    # 每 2 小时检查一次
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: '强制从指定 tag 同步（留空则自动检测上游最新）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+# 防止 schedule 与手动触发的实例并发执行，避免 reset/force push 互相踩踏
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Check upstream latest release
+        id: check
+        run: |
+          set -euo pipefail
+
+          MANUAL_TAG="${{ github.event.inputs.upstream_tag || '' }}"
+
+          # 使用带认证 Token 的 curl 请求，享有独立配额，彻底告别匿名 IP 限流
+          fetch_release() {
+            local url="$1"
+            curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+                      -H "Accept: application/vnd.github.v3+json" \
+                      -H "User-Agent: GitHub-Actions-Sync" \
+                      "$url"
+          }
+
+          # 手动指定 tag 时查该 tag，否则获取上游 releases 列表第一条（含 prerelease）
+          if [ -n "$MANUAL_TAG" ]; then
+            RELEASE_JSON=$(fetch_release "https://api.github.com/repos/2dust/v2rayNg/releases/tags/$MANUAL_TAG")
+          else
+            RELEASE_JSON=$(fetch_release "https://api.github.com/repos/2dust/v2rayNg/releases?per_page=1" | jq -c '.[0]')
+          fi
+
+          UPSTREAM_TAG=$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // empty')
+
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "::warning::未能获取到上游 release 信息（可能是网络异常或上游无可用版本），跳过本次同步"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_prerelease=$(printf '%s' "$RELEASE_JSON" | jq -r '.prerelease // false')" >> "$GITHUB_OUTPUT"
+          echo "upstream_name=$(printf '%s' "$RELEASE_JSON" | jq -r '.name // ""')" >> "$GITHUB_OUTPUT"
+
+          # body 可能含多行，用文件传递；末尾追加一行 mod 声明
+          printf '%s' "$RELEASE_JSON" | jq -r '.body // ""' > /tmp/upstream_body.txt
+          {
+            echo ""
+            echo "---"
+            echo "> 由 GitHub Actions 自动同步自上游 2dust/v2rayNG 的版本 ${UPSTREAM_TAG}，已移除推广入口。"
+          } >> /tmp/upstream_body.txt
+
+          # 检查 mod 仓库是否已有该版本的 release
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$UPSTREAM_TAG")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "::notice::Mod 仓库已有 $UPSTREAM_TAG release，跳过本次同步"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::发现新版本 $UPSTREAM_TAG，开始同步"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 检出本仓库（使用最新 checkout 规避 Node 废弃提醒）
+      - name: Checkout mod repo
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream code
+        id: sync
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+
+          # 备份 mod 自己的 CI 目录（避免被上游覆盖）
+          [ -d .github ] || { echo "::error::.github 目录不存在，中止"; exit 1; }
+          mkdir -p /tmp/keep
+          cp -r .github /tmp/keep/ci-backup
+
+          git remote add upstream https://github.com/2dust/v2rayNg.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/2dust/v2rayNg.git
+          git fetch upstream --tags --force
+
+          # 确认 fetch 到了目标 tag
+          git rev-parse --verify --quiet "$UPSTREAM_TAG^{commit}" >/dev/null \
+            || { echo "::error::上游不存在 tag $UPSTREAM_TAG"; exit 1; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git reset --hard "$UPSTREAM_TAG"
+
+          # 恢复 mod 自己的 CI
+          rm -rf .github
+          cp -r /tmp/keep/ci-backup .github
+          echo "已恢复 mod 仓库的 .github 目录"
+
+          # 动态获取默认分支，兼容 master / main
+          echo "default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')" >> "$GITHUB_OUTPUT"
+
+      - name: Remove promotion, modify README and redirect links
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import re
+          import sys
+
+          failures = []
+
+          def edit(path, old, new, pat=False):
+              """pat=True 时 old 为正则表达式"""
+              if not os.path.exists(path):
+                  failures.append(f"文件不存在: {path}")
+                  return
+              with open(path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+              if pat:
+                  new_content, n = re.subn(old, new, content)
+              else:
+                  new_content, n = content.replace(old, new), content.count(old)
+              if n == 0:
+                  failures.append(f"未找到目标: {path} :: {old}")
+                  return
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(new_content)
+              print(f"✅ 已修改 {path} (命中 {n} 处)")
+
+          # 1) 移除 drawer 列表中的推广入口（兼容不同空格缩进与换行格式）
+          edit(
+              'V2rayNG/app/src/main/java/com/v2ray/ang/ui/main/MainDrawer.kt',
+              r'[ \t]*MainDestination\.Promotion,[\r\n]+', '', pat=True)
+
+          # 2) AppConfig.kt：原 github 项目链接转向 mod 仓库
+          edit(
+              'V2rayNG/app/src/main/java/com/v2ray/ang/AppConfig.kt',
+              '2dust/v2rayNG', '91fabu/v2rayNG-noAD')
+
+          # 3) README.md：顶部插入醒目大字标红的去广告说明
+          readme_path = 'README.md'
+          header_notice = """<div align="center">
+            <h2 style="color: #d73a49; font-weight: bold;">
+              ⚠️ 本项目为 v2rayNG 去广告、去推广修改版 (Mod)
+            </h2>
+            <p><strong>已移除所有商业推广入口及外部推广引流链接，保持与上游代码自动同步构建。</strong></p>
+          </div>
+
+          ---
+
+          """
+          if os.path.exists(readme_path):
+              with open(readme_path, 'r', encoding='utf-8') as f:
+                  orig_readme = f.read()
+              with open(readme_path, 'w', encoding='utf-8') as f:
+                  f.write(header_notice + orig_readme)
+              print("✅ README.md 顶部标红警示已注入")
+          else:
+              with open(readme_path, 'w', encoding='utf-8') as f:
+                  f.write(header_notice)
+              print("⚠️ 原仓库无 README.md，已自动新建并注入标红警示")
+
+          if failures:
+              for msg in failures:
+                  print(f"::error:: {msg}")
+              print("::error:: 处理失败，发布已中止 — 请人工检查代码结构变化")
+              sys.exit(1)
+          print("✅ 去推广、修改 README 与重定向链接全部完成")
+          PYTHON_SCRIPT
+
+      # 发布前最后一道闸：推广入口必须消失、链接替换与 README 修改必须生效
+      - name: Verify promotion removed and README modified
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          DRAWER='V2rayNG/app/src/main/java/com/v2ray/ang/ui/main/MainDrawer.kt'
+          APPCONFIG='V2rayNG/app/src/main/java/com/v2ray/ang/AppConfig.kt'
+
+          if grep -q 'MainDestination\.Promotion,' "$DRAWER"; then
+            echo "::error::推广入口仍存在于 drawer 列表"
+            exit 1
+          fi
+          if grep -q '2dust/v2rayNG' "$APPCONFIG"; then
+            echo "::error::AppConfig 仍含上游原始链接，改链接未生效"
+            exit 1
+          fi
+          grep -q '91fabu/v2rayNG-noAD' "$APPCONFIG" \
+            || { echo "::error::AppConfig 未包含 mod 仓库链接"; exit 1; }
+          grep -q '去广告、去推广修改版' README.md \
+            || { echo "::error::README.md 未能成功插入标红修改说明"; exit 1; }
+
+          echo "✅ 校验通过：推广入口已移除，链接已替换，README 已更新"
+
+      - name: Commit and push
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+          BRANCH="${{ steps.sync.outputs.default_branch }}"
+
+          git add -A
+          # 无变更时跳过 commit
+          if git diff --cached --quiet; then
+            echo "::notice::工作树无变化，跳过 commit"
+          else
+            git commit -m "Sync upstream $UPSTREAM_TAG - Remove promotion & Update README"
+          fi
+
+          git push --force origin "$BRANCH"
+
+          git tag -f "$UPSTREAM_TAG"
+          git push --force origin "$UPSTREAM_TAG"
+
+      - name: Create release with upstream info
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+          UPSTREAM_PRERELEASE="${{ steps.check.outputs.upstream_prerelease }}"
+          UPSTREAM_NAME="${{ steps.check.outputs.upstream_name }}"
+          BRANCH="${{ steps.sync.outputs.default_branch }}"
+
+          gh release create "$UPSTREAM_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BRANCH" \
+            --title "${UPSTREAM_NAME:-$UPSTREAM_TAG}" \
+            --notes-file /tmp/upstream_body.txt \
+            $([ "$UPSTREAM_PRERELEASE" = "true" ] && echo --prerelease || true)
+
+          echo "✅ Release 已创建: $UPSTREAM_TAG"
+
+      - name: Trigger build-all workflow
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+          BRANCH="${{ steps.sync.outputs.default_branch }}"
+
+          gh workflow run build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$BRANCH" \
+            -f release_tag="$UPSTREAM_TAG"
+          echo "✅ 已触发 build，版本: $UPSTREAM_TAG"
